@@ -1,17 +1,23 @@
 import json
 import time
-import sys
 import clr
-import os
-import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
-import threading
 import logging
 from logging.handlers import RotatingFileHandler
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from datetime import datetime
 from tkinter import PhotoImage
+import tkinter as tk
+from pystray import Icon, Menu, MenuItem
+from PIL import Image, ImageDraw
+import threading
+import configparser
+import os
+import winreg
+import sys
+from task import Task
+
 
 plt.rcParams['font.sans-serif'] = ["SimHei"]  # 设置字体为黑体
 plt.rcParams['axes.unicode_minus'] = False  # 正常显示负号
@@ -27,13 +33,7 @@ def get_resource_path(relative_path):
     return os.path.join(current_dir, relative_path)
 
 
-# 加载 DLL（假设 Central.iGame.dll 在开发环境中与当前脚本同目录，或按实际相对路径调整）
-dll_path = get_resource_path("bin/Central.iGame.dll")  # 如果 DLL 在 bin 目录下，这里改为 "bin/Central.iGame.dll"
-clr.AddReference(dll_path)
-from Central import Wmi
-
-
-def get_file_path(relative_path):
+def get_file_path2(relative_path):
     """获取配置文件路径（外部可编辑）"""
     if hasattr(sys, '_MEIPASS'):
         # 打包后：可执行文件所在目录（不是临时目录）
@@ -43,6 +43,23 @@ def get_file_path(relative_path):
         # 开发时：项目源码目录（根据实际结构调整）
         project_dir = os.path.dirname(os.path.abspath(__file__))  # 当前脚本所在目录
         return os.path.join(project_dir, "data", relative_path)  # 配置文件在 ./data 下
+
+def get_file_path(pre_path,relative_path):
+    """获取配置文件路径（外部可编辑）"""
+    if hasattr(sys, '_MEIPASS'):
+        # 打包后：可执行文件所在目录（不是临时目录）
+        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+        return os.path.join(exe_dir,pre_path, relative_path)
+    else:
+        # 开发时：项目源码目录（根据实际结构调整）
+        project_dir = os.path.dirname(os.path.abspath(__file__))  # 当前脚本所在目录
+        return os.path.join(project_dir, "data", relative_path)  # 配置文件在 ./data 下
+
+
+# 加载 DLL（假设 Central.iGame.dll 在开发环境中与当前脚本同目录，或按实际相对路径调整）
+dll_path = get_resource_path("bin/Central.iGame.dll")  # 如果 DLL 在 bin 目录下，这里改为 "bin/Central.iGame.dll"
+clr.AddReference(dll_path)
+from Central import Wmi
 
 
 class FanController:
@@ -101,7 +118,7 @@ class FanController:
     def save_config(self, file_path=None):
         """保存配置到JSON文件（包含模式状态和曲线参数）"""
         if not file_path:
-            file_path = get_file_path("fan_config.json")
+            file_path = get_file_path("conf","fan_config.json")
 
         # 构建配置字典
         config = {
@@ -124,7 +141,7 @@ class FanController:
     def load_config(self, file_path=None):
         """从JSON文件加载配置（恢复模式状态和曲线参数）"""
         if not file_path:
-            file_path = get_file_path("fan_config.json")
+            file_path = get_file_path("conf","fan_config.json")
 
         if not os.path.exists(file_path):
             return False, "配置文件不存在"
@@ -262,7 +279,7 @@ class FanController:
         """
         根据温度和曲线计算目标转速（原始值）
         优化点：
-        .gitignore. 预缓存排序后的温度列表（避免重复排序）
+        1. 预缓存排序后的温度列表（避免重复排序）
         2. 用二分查找替代线性遍历（提升中间温度查找效率）
         3. 优化边界条件处理（确保极端温度的稳定性）
         """
@@ -417,7 +434,7 @@ class FanCurveGUI:
         self.edit_gpu_curve = self.controller.applied_gpu_curve.copy()
 
         # 初始化界面
-        self.root.title("iGame风扇控制")
+        self.root.title("iGame风扇控制 V1.1")
         self.root.geometry("1400x800")
         self.root.minsize(1200, 800)
         self.root.resizable(True, True)
@@ -623,7 +640,7 @@ class FanCurveGUI:
         self._set_config_buttons_state(self.controller.is_custom_mode and not self.controller.is_full_mode)
 
         # 全局点击事件（处理输入框失焦）
-        self.root.bind("<Button-.gitignore>", self._handle_global_click)
+        self.root.bind("<Button-1>", self._handle_global_click)
 
     def _create_curve_entries(self, parent, curve_data, is_cpu):
         """创建曲线配置输入框"""
@@ -972,7 +989,7 @@ class FanCurveGUI:
         try:
             result = self.controller.set_system_perf_mode(mode_name)
             if self._query_current_mode():
-                self.logger.info(f"切换至{mode_name}成功（返回值：{result}）")
+                self.logger.info(f"切换至{mode_name}成功")
         except Exception as e:
             error_msg = f"切换{mode_name}失败：{str(e)}"
             self.logger.error(error_msg)
@@ -1242,7 +1259,7 @@ class FanCurveGUI:
 
             # 保存为新文件
             new_file = f"fan_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-            new_path = get_file_path("new_file")
+            new_path = get_file_path("logs","new_file")
             with open(new_path, "w", encoding="utf-8") as f:
                 f.write(content)
 
@@ -1266,10 +1283,168 @@ class FanCurveGUI:
         self.root.destroy()
 
 
+class TrayApp:
+    def __init__(self, root, main_gui,tray_icon):
+        self.root = root
+        self.main_gui = main_gui  # 关联主GUI实例
+        self.tray_icon = tray_icon
+        self.tray_started = False
+        self.start_minimized = False
+        self.startup_enabled = False
+        self.config = get_file_path("conf","config.ini")
+
+        # 获取程序路径
+        self.exe_path = get_file_path2("iGameFans.exe")
+
+        self.task_name = "iGameFansAutoStart"  # 任务名称
+        self.task_manager = Task()  # 实例化任务管理器
+
+
+        # 注册表配置
+        self.registry_path = r'Software\Microsoft\Windows\CurrentVersion\Run'
+        self.registry_name = "iGameFans"
+
+        # 初始化配置
+        self.load_config()
+        self.check_startup_status()
+
+        # 绑定窗口事件
+        self.root.protocol('WM_DELETE_WINDOW', self.minimize_to_tray)
+        self.root.bind('<Unmap>', self.on_minimize)
+
+    def create_icon(self):
+        """创建托盘图标（可替换为实际图片）"""
+        try:
+            return Image.open(get_file_path('asset',"iGame.png"))
+        except:
+            #  fallback：创建简单图标
+            img = Image.new('RGB', (16, 16), color='green')
+            return img
+
+    def create_menu(self):
+        """创建托盘右键菜单"""
+        return Menu(
+            MenuItem('还原窗口', self.restore_window, default=True),
+            MenuItem('启动设置', Menu(
+                MenuItem(
+                    '启动时最小化',
+                    self.toggle_start_minimized,
+                    checked=lambda _: self.start_minimized
+                ),
+                MenuItem(
+                    '开机自启动',
+                    self.toggle_startup,
+                    checked=lambda _: self.startup_enabled
+                )
+            )),
+            MenuItem('退出程序', self.exit_app)
+        )
+
+    # 配置管理
+    def load_config(self):
+        """加载启动配置"""
+        config = configparser.ConfigParser()
+        if os.path.exists(self.config):
+            config.read(self.config, encoding='utf-8')
+            self.start_minimized = config.getboolean(
+                'Settings', 'start_minimized', fallback=False
+            )
+
+    def save_config(self):
+        """保存启动配置"""
+        config = configparser.ConfigParser()
+        config['Settings'] = {'start_minimized': str(self.start_minimized)}
+        with open(self.config, 'w', encoding='utf-8') as f:
+            config.write(f)
+
+    # 开机启动管理（核心修改：改用任务计划）
+    def check_startup_status(self):
+        """检查自启动状态（通过查询任务计划是否存在）"""
+        # 调用 Task 类的 check_task_exists 方法
+        self.startup_enabled = self.task_manager.check_task_exists(self.task_name)
+
+    def toggle_startup(self, icon, item):
+        """切换自启动状态（创建/删除任务计划）"""
+        if self.startup_enabled:
+            # 关闭自启动：删除任务计划
+            success = self.task_manager.delete_scheduled_task(self.task_name)
+            if success:
+                self.startup_enabled = False
+                logging.info("开机自启动已关闭")
+            else:
+                logging.info("开机自启动关闭失败")
+        else:
+            # 先检查任务是否已存在，避免重复创建
+            if self.task_manager.check_task_exists(self.task_name):
+                logging.info("开机自启动已存在，无需重复创建")
+                self.startup_enabled = True
+                self.tray_icon.update_menu()
+                return
+            # 开启自启动：创建任务计划
+            success = self.task_manager.create_scheduled_task(self.task_name, self.exe_path)
+            if success:
+                self.startup_enabled = True
+                logging.info("开机自启动已开启")
+            else:
+                logging.info("开机自启动开启失败")
+        # 更新菜单勾选状态
+        self.tray_icon.update_menu()
+
+    def toggle_start_minimized(self, icon, item):
+        """切换启动时最小化状态"""
+        self.start_minimized = not self.start_minimized
+        self.save_config()
+        self.tray_icon.update_menu()
+
+    # 窗口管理
+    def start_tray(self):
+        """启动托盘服务"""
+        if not self.tray_started:
+            self.tray_icon = Icon(
+                name=self.root.title,
+                icon=self.create_icon(),
+                menu=self.create_menu()
+            )
+            self.tray_thread = threading.Thread(
+                target=self.tray_icon.run,
+                daemon=True
+            )
+            self.tray_thread.start()
+            self.tray_started = True
+
+        # 启动时根据配置最小化
+        if self.start_minimized:
+            self.minimize_to_tray()
+
+    def minimize_to_tray(self):
+        """最小化到托盘"""
+        self.root.withdraw()
+
+    def on_minimize(self, event):
+        """窗口最小化时自动隐藏到托盘"""
+        if self.root.state() == 'iconic':
+            self.minimize_to_tray()
+
+    def restore_window(self):
+        """从托盘还原窗口"""
+        self.root.deiconify()
+        self.root.state('normal')
+        self.root.lift()
+
+    def exit_app(self):
+        """退出程序"""
+        if self.tray_icon:
+            self.tray_icon.stop()
+            self.tray_icon = None  # 清除引用
+        # 确保主窗口关闭
+        self.root.after(0, self.main_gui.on_close)  # 使用主线程关闭窗口
+
+
+
 def init_logging():
     """初始化日志系统"""
     log_filename = f"fan_control_log_{datetime.now().strftime('%Y%m%d')}.txt"
-    log_path = get_file_path(log_filename)
+    log_path = get_file_path("logs",log_filename)
 
     log_format = logging.Formatter('%(asctime)s - %(message)s', datefmt='%H:%M:%S')
     log_handler = RotatingFileHandler(
@@ -1299,19 +1474,19 @@ if __name__ == "__main__":
         # 创建主窗口并启动GUI
         root = tk.Tk()
 
-        logo_img = PhotoImage(file=get_file_path("iGame.png"))  # 加载图片
+        logo_img = PhotoImage(file=get_file_path("asset","iGame.png"))  # 加载图片
         root.iconphoto(True, logo_img)
         # 用 Label 显示图片
         # logo_label = tk.Label(root, image=logo_img)
-        # logo_label.pack(padx=.gitignore, pady=.gitignore)
+        # logo_label.pack(padx=1, pady=1)
 
         default_font = ('SimHei', 13)  # 主字体大小
         root.option_add('*Font', default_font)
 
         app = FanCurveGUI(root, controller, logger)
-
-        # 绑定窗口关闭事件（确保资源正确释放）
-        root.protocol("WM_DELETE_WINDOW", app.on_close)
+        # 创建托盘应用
+        tray_app = TrayApp(root, app, logo_img)
+        tray_app.start_tray()
 
         # 启动主事件循环
         root.mainloop()

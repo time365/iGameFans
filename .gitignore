@@ -31,7 +31,7 @@ fan_control_log_*.txt
 fan_config.json
 
 # IDE 配置（JetBrains 系列如 PyCharm）
-.idea/
+../.idea/
 *.iml
 *.iws
 *.ipr
