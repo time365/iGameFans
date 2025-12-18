@@ -18,7 +18,6 @@ import winreg
 import sys
 from task import Task
 
-
 plt.rcParams['font.sans-serif'] = ["SimHei"]  # 设置字体为黑体
 plt.rcParams['axes.unicode_minus'] = False  # 正常显示负号
 
@@ -44,12 +43,13 @@ def get_file_path2(relative_path):
         project_dir = os.path.dirname(os.path.abspath(__file__))  # 当前脚本所在目录
         return os.path.join(project_dir, "data", relative_path)  # 配置文件在 ./data 下
 
-def get_file_path(pre_path,relative_path):
+
+def get_file_path(pre_path, relative_path):
     """获取配置文件路径（外部可编辑）"""
     if hasattr(sys, '_MEIPASS'):
         # 打包后：可执行文件所在目录（不是临时目录）
         exe_dir = os.path.dirname(os.path.abspath(sys.executable))
-        return os.path.join(exe_dir,pre_path, relative_path)
+        return os.path.join(exe_dir, pre_path, relative_path)
     else:
         # 开发时：项目源码目录（根据实际结构调整）
         project_dir = os.path.dirname(os.path.abspath(__file__))  # 当前脚本所在目录
@@ -80,6 +80,7 @@ class FanController:
         self.is_custom_mode = False  # 是否启用自定义模式
         self.is_full_mode = False  # 是否启用强冷模式
         self.last_non_full_mode = "auto"  # 强冷启用前的模式（用于恢复）
+        self.same_speed = False
 
         # 性能模式映射（code: name）
         self.perf_mode_map = {
@@ -118,7 +119,7 @@ class FanController:
     def save_config(self, file_path=None):
         """保存配置到JSON文件（包含模式状态和曲线参数）"""
         if not file_path:
-            file_path = get_file_path("conf","fan_config.json")
+            file_path = get_file_path("conf", "fan_config.json")
 
         # 构建配置字典
         config = {
@@ -128,7 +129,8 @@ class FanController:
             "CurrentFanMode": self.current_fan_mode,
             "IsCustomMode": self.is_custom_mode,
             "IsFullMode": self.is_full_mode,
-            "LastNonFullMode": self.last_non_full_mode
+            "LastNonFullMode": self.last_non_full_mode,
+            "SameSpeed": self.same_speed
         }
 
         try:
@@ -141,7 +143,7 @@ class FanController:
     def load_config(self, file_path=None):
         """从JSON文件加载配置（恢复模式状态和曲线参数）"""
         if not file_path:
-            file_path = get_file_path("conf","fan_config.json")
+            file_path = get_file_path("conf", "fan_config.json")
 
         if not os.path.exists(file_path):
             return False, "配置文件不存在"
@@ -163,6 +165,7 @@ class FanController:
             self.current_fan_mode = config.get("CurrentFanMode", "auto")
             self.is_custom_mode = config.get("IsCustomMode", False)
             self.is_full_mode = config.get("IsFullMode", False)
+            self.same_speed = config.get("SameSpeed", False)
             self.last_non_full_mode = config.get("LastNonFullMode", "auto")
 
             # 转换为温度-转速字典
@@ -323,6 +326,14 @@ class FanController:
     def set_fan_speed(self, cpu_speed, gpu_speed):
         """设置风扇转速（原始值）"""
         try:
+            # 同速模式
+            if self.same_speed:
+                temps = self.get_temperatures()
+                if temps["cpu"] > temps["gpu"]:
+                    gpu_speed = cpu_speed
+                else:
+                    cpu_speed = gpu_speed
+
             # 限制转速范围（0-6300）
             cpu_clamped = max(0, min(6300, cpu_speed))
             gpu_clamped = max(0, min(6300, gpu_speed))
@@ -427,6 +438,9 @@ class FanCurveGUI:
         self.fan_mode_var = tk.StringVar(value="自动模式")
         self.full_mode_choice = tk.StringVar(  # 强冷模式选项（开/关）
             value="开" if self.controller.is_full_mode else "关"
+        )
+        self.same_speed_choice = tk.StringVar(  # 强冷模式选项（开/关）
+            value="开" if self.controller.same_speed else "关"
         )
 
         # 曲线编辑缓存
@@ -605,6 +619,31 @@ class FanCurveGUI:
         self.threshold_entry.bind("<FocusOut>", self._on_threshold_change)
         self.threshold_entry.bind("<Return>", lambda e: self._handle_enter_key(e, is_threshold=True))
 
+        # 同速模式
+        same_speed_frame = ttk.Frame(config_card)
+        same_speed_frame.pack(fill="x", pady=(0, 10))
+
+        ttk.Label(same_speed_frame, text="同速模式：", style="Header.TLabel").pack(side="left", padx=(0, 15))
+        self.same_speed_choice_open = ttk.Radiobutton(
+            same_speed_frame,
+            text="开",
+            variable=self.same_speed_choice,
+            value="开",
+            command=self.switch_same_speed_mode,
+            style="Custom.TRadiobutton"
+        )
+        self.same_speed_choice_open.pack(side="left", padx=5)
+
+        self.same_speed_choice_close = ttk.Radiobutton(
+            same_speed_frame,
+            text="关",
+            variable=self.same_speed_choice,
+            value="关",
+            command=self.switch_same_speed_mode,
+            style="Custom.TRadiobutton"
+        )
+        self.same_speed_choice_close.pack(side="left", padx=5)
+
         # 配置文件管理按钮
         config_buttons_frame = ttk.Frame(config_card)
         config_buttons_frame.pack(fill="x", pady=(10, 0))
@@ -616,7 +655,7 @@ class FanCurveGUI:
         #                                      command=lambda: self.save_config(as_new=True),style="Custom.TButton")
         # self.save_as_config_btn.pack(side="left", padx=5)
         self.restore_default_btn = ttk.Button(config_buttons_frame, text="恢复默认",
-                                              command=self.restore_default_config,style="Custom.TButton")
+                                              command=self.restore_default_config, style="Custom.TButton")
         self.restore_default_btn.pack(side="left", padx=5)
 
         # 右侧：曲线预览卡片
@@ -822,6 +861,7 @@ class FanCurveGUI:
                 self.controller.current_fan_mode = "manual"
                 self.controller.is_custom_mode = True
                 self.controller.is_full_mode = False
+                self.controller.same_speed = False
 
                 # 更新编辑缓存和输入框
                 self.edit_cpu_curve = self.controller.applied_cpu_curve.copy()
@@ -892,6 +932,8 @@ class FanCurveGUI:
         state = "normal" if enabled else "disabled"
         # self.load_config_btn.config(state=state)
         # self.save_as_config_btn.config(state=state)
+        self.same_speed_choice_open.config(state=state)
+        self.same_speed_choice_close.config(state=state)
         self.restore_default_btn.config(state=state)
 
     def _init_plot(self):
@@ -1019,6 +1061,22 @@ class FanCurveGUI:
             current_mode = self.controller.current_fan_mode
             self.fan_mode_var.set(self.reverse_fan_mapping.get(current_mode, "自动模式"))
 
+    def switch_same_speed_mode(self):
+        """同速模式开关切换"""
+        choice = self.same_speed_choice.get()
+        target_enable = (choice == "开")
+        # 状态未变化则不处理
+        if target_enable == self.controller.same_speed:
+            return
+
+        # 切换同速模式
+        if target_enable:
+            self.controller.same_speed = True
+        else:
+            self.controller.same_speed = False
+
+        logging.info(f"风扇同速模式：{'开' if target_enable else '关'}")
+
     def _on_full_mode_change(self):
         """处理强冷模式开/关切换"""
         choice = self.full_mode_choice.get()
@@ -1079,6 +1137,9 @@ class FanCurveGUI:
                 # 同步强冷模式状态
                 self._sync_full_mode_status()
 
+                # 同步同速模式状态
+                self._sync_same_speed_status()
+
                 # 获取温度和转速
                 temps = self.controller.get_temperatures()
                 speeds = self.controller.get_fan_speeds()
@@ -1120,8 +1181,22 @@ class FanCurveGUI:
                 self.controller.is_full_mode = new_full_mode
                 self.full_mode_choice.set("开" if new_full_mode else "关")
 
-                # 强冷关闭时恢复基础模式显示
-                if not new_full_mode:
+                # 外部开启强冷模式
+                if new_full_mode:
+                    self.controller.last_non_full_mode = self.controller.current_fan_mode
+                    self.controller.wmi.FanControlOpen(False)
+                    self.controller.is_custom_mode = False
+                # 外部关闭强冷模式
+                else:
+                    self.controller.current_fan_mode = self.controller.last_non_full_mode
+                    if self.controller.current_fan_mode == "manual":
+                        self.controller.wmi.FanControlOpen(True)
+                        self.controller.is_custom_mode = True
+                    else:
+                        self.controller.wmi.FanControlOpen(False)
+                        self.controller.is_custom_mode = False
+
+                    # 强冷关闭时恢复基础模式显示
                     self.fan_mode_var.set(
                         "自定义模式" if self.controller.current_fan_mode == "manual" else "自动模式"
                     )
@@ -1134,6 +1209,10 @@ class FanCurveGUI:
                 logging.info(f"强冷模式同步：{'开' if new_full_mode else '关'}")
         except Exception as e:
             logging.warning(f"同步强冷模式失败: {str(e)}")
+
+    def _sync_same_speed_status(self):
+        """同步同速模式状态"""
+        self.same_speed_choice.set("开" if self.controller.same_speed else "关")
 
     def _update_perf_mode_buttons(self):
         """更新性能模式按钮样式"""
@@ -1259,7 +1338,7 @@ class FanCurveGUI:
 
             # 保存为新文件
             new_file = f"fan_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-            new_path = get_file_path("logs","new_file")
+            new_path = get_file_path("logs", "new_file")
             with open(new_path, "w", encoding="utf-8") as f:
                 f.write(content)
 
@@ -1284,21 +1363,20 @@ class FanCurveGUI:
 
 
 class TrayApp:
-    def __init__(self, root, main_gui,tray_icon):
+    def __init__(self, root, main_gui, tray_icon):
         self.root = root
         self.main_gui = main_gui  # 关联主GUI实例
         self.tray_icon = tray_icon
         self.tray_started = False
         self.start_minimized = False
         self.startup_enabled = False
-        self.config = get_file_path("conf","config.ini")
+        self.config = get_file_path("conf", "config.ini")
 
         # 获取程序路径
         self.exe_path = get_file_path2("iGameFans.exe")
 
         self.task_name = "iGameFansAutoStart"  # 任务名称
         self.task_manager = Task()  # 实例化任务管理器
-
 
         # 注册表配置
         self.registry_path = r'Software\Microsoft\Windows\CurrentVersion\Run'
@@ -1315,7 +1393,7 @@ class TrayApp:
     def create_icon(self):
         """创建托盘图标（可替换为实际图片）"""
         try:
-            return Image.open(get_file_path('asset',"iGame.png"))
+            return Image.open(get_file_path('asset', "iGame.png"))
         except:
             #  fallback：创建简单图标
             img = Image.new('RGB', (16, 16), color='green')
@@ -1440,11 +1518,10 @@ class TrayApp:
         self.root.after(0, self.main_gui.on_close)  # 使用主线程关闭窗口
 
 
-
 def init_logging():
     """初始化日志系统"""
     log_filename = f"fan_control_log_{datetime.now().strftime('%Y%m%d')}.txt"
-    log_path = get_file_path("logs",log_filename)
+    log_path = get_file_path("logs", log_filename)
 
     log_format = logging.Formatter('%(asctime)s - %(message)s', datefmt='%H:%M:%S')
     log_handler = RotatingFileHandler(
@@ -1474,7 +1551,7 @@ if __name__ == "__main__":
         # 创建主窗口并启动GUI
         root = tk.Tk()
 
-        logo_img = PhotoImage(file=get_file_path("asset","iGame.png"))  # 加载图片
+        logo_img = PhotoImage(file=get_file_path("asset", "iGame.png"))  # 加载图片
         root.iconphoto(True, logo_img)
         # 用 Label 显示图片
         # logo_label = tk.Label(root, image=logo_img)

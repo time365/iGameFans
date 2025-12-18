@@ -24,8 +24,9 @@
         83
     ],
     "LowTempThreshold": 20,
-    "CurrentFanMode": "auto",
-    "IsCustomMode": false,
+    "CurrentFanMode": "manual",
+    "IsCustomMode": true,
     "IsFullMode": false,
-    "LastNonFullMode": "manual"
+    "LastNonFullMode": "manual",
+    "SameSpeed": true
 }
