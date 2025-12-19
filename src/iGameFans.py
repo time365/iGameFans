@@ -17,6 +17,8 @@ import os
 import winreg
 import sys
 from task import Task
+import ColorUtils
+import math
 
 plt.rcParams['font.sans-serif'] = ["SimHei"]  # 设置字体为黑体
 plt.rcParams['axes.unicode_minus'] = False  # 正常显示负号
@@ -60,6 +62,8 @@ def get_file_path(pre_path, relative_path):
 dll_path = get_resource_path("bin/Central.iGame.dll")  # 如果 DLL 在 bin 目录下，这里改为 "bin/Central.iGame.dll"
 clr.AddReference(dll_path)
 from Central import Wmi
+from Central import Win32
+from Central.MCU import MCUControl
 
 
 class FanController:
@@ -70,8 +74,10 @@ class FanController:
     def __init__(self):
         # 核心参数初始化
         self.wmi = Wmi  # 硬件交互类（静态方法调用）
+        self.win32 = Win32
+        self.mcu = MCUControl
         self.monitor_interval = 1  # 监控间隔（秒）
-        self.low_temp_threshold = 45  # 低温阈值（℃）
+        self.low_temp_threshold = 20  # 低温阈值（℃）
         self.current_fan_mode = "auto"  # 当前风扇模式（auto/manual）
         self.speed_conversion = 63  # 百分比转原始值系数（0-100% → 0-6300）
         self.current_perf_mode = "未知"  # 当前系统性能模式
@@ -81,12 +87,22 @@ class FanController:
         self.is_full_mode = False  # 是否启用强冷模式
         self.last_non_full_mode = "auto"  # 强冷启用前的模式（用于恢复）
         self.same_speed = False
+        self.keyboard = None
+        self.led = None
+        self.win_lock = None
+        self.auto_close_light = None
+        self.charging_mode = None
 
         # 性能模式映射（code: name）
         self.perf_mode_map = {
             2: "狂暴模式",
             1: "静音游戏",
             0: "超长续航",
+        }
+        self.gpu_mode_map = {
+            3: "集显模式",
+            1: "独显直连",
+            0: "混合模式",
         }
         # 反向映射（name: code）
         self.perf_mode_code = {v: k for k, v in self.perf_mode_map.items()}
@@ -130,7 +146,12 @@ class FanController:
             "IsCustomMode": self.is_custom_mode,
             "IsFullMode": self.is_full_mode,
             "LastNonFullMode": self.last_non_full_mode,
-            "SameSpeed": self.same_speed
+            "SameSpeed": self.same_speed,
+            "Keyboard": self.keyboard,
+            "Led": self.led,
+            "WinLock": self.win_lock,
+            "AutoCloseLight": self.auto_close_light,
+            "ChargingMode": self.charging_mode,
         }
 
         try:
@@ -161,24 +182,37 @@ class FanController:
                 self.gpu_fans = [0, 38, 38, 38, 38, 47, 55, 64, 74, 83]
 
             # 加载模式状态和阈值
-            self.low_temp_threshold = config.get("LowTempThreshold", 45)
+            self.low_temp_threshold = config.get("LowTempThreshold", 20)
             self.current_fan_mode = config.get("CurrentFanMode", "auto")
             self.is_custom_mode = config.get("IsCustomMode", False)
             self.is_full_mode = config.get("IsFullMode", False)
             self.same_speed = config.get("SameSpeed", False)
             self.last_non_full_mode = config.get("LastNonFullMode", "auto")
+            self.keyboard = config.get("Keyboard", ["渐变", "DBlue", "亮度4"])
+            self.led = config.get("Led", ["渐变", "DBlue", "亮度4"])
+            self.win_lock = config.get("WinLock", False)
+            self.auto_close_light = config.get("AutoCloseLight", False)
+            self.charging_mode = config.get("ChargingMode", "最大电池电量")
 
             # 转换为温度-转速字典
             self.applied_cpu_curve = {i * 10: self.cpu_fans[i] for i in range(10)}
             self.applied_gpu_curve = {i * 10: self.gpu_fans[i] for i in range(10)}
 
             # 同步硬件状态
+            self.current_fan_mode = self.last_non_full_mode
             if self.is_full_mode:
                 self.wmi.SetFanFullMode(True)
                 self.wmi.FanControlOpen(False)
             else:
                 self.wmi.SetFanFullMode(False)
                 self.wmi.FanControlOpen(self.is_custom_mode)
+
+            self.win32.SetWinkeyLock(not self.win_lock)
+            self.controller.mcu.AutoCloselight(self.auto_close_light)
+            kmode, kcolor, klight = self.keyboard
+            self.light_switch(1, kmode, kcolor, klight)
+            amode, acolor, alight = self.led
+            self.light_switch(0, amode, acolor, alight)
 
             return True, file_path
         except Exception as e:
@@ -348,6 +382,10 @@ class FanController:
             return "当前为强冷模式（全速运行）", False
 
         cpu_temp, gpu_temp = temps["cpu"], temps["gpu"]
+
+        if self.wmi.GetGPUMode() == 3:
+            gpu_temp = cpu_temp
+
         is_low_temp = (cpu_temp < self.low_temp_threshold) and (gpu_temp < self.low_temp_threshold)
         log_msg = ""
         mode_changed = False
@@ -357,7 +395,7 @@ class FanController:
             if self.current_fan_mode != "auto":
                 self.wmi.FanControlOpen(False)
                 self.current_fan_mode = "auto"
-                self.is_custom_mode = False
+                self.is_custom_mode = True
                 self.last_non_full_mode = "auto"
                 mode_changed = True
                 log_msg = f"切换至自动风扇（双温低于{self.low_temp_threshold}℃）"
@@ -392,6 +430,29 @@ class FanController:
         except Exception as e:
             logging.warning(f"恢复默认模式失败: {str(e)}")
 
+    def light_switch(self, region, mode, color, light):
+        level = {
+            "亮度0": 0,
+            "亮度1": int(255 / 4),
+            "亮度2": int(255 / 3),
+            "亮度3": int(255 / 2),
+            "亮度4": int(255 / 1),
+        }
+        command = {
+            "关闭": 0,
+            "打开": 1,
+            "常亮": 2,
+            "呼吸": 3,
+            "渐变": 4
+        }
+        r, g, b = ColorUtils.Color[color]
+
+        if mode == "关闭":
+            self.mcu.LightSwitch(region, command[mode], r, g, b, level[light])
+        else:
+            self.mcu.LightSwitch(region, command["打开"], r, g, b, level[light])
+            self.mcu.LightSwitch(region, command[mode], r, g, b, level[light])
+
 
 class FanCurveGUI:
     """
@@ -406,6 +467,24 @@ class FanCurveGUI:
         self.is_monitoring = False  # 监控状态标记
         self.log_window = None  # 日志窗口引用
         self.log_refresh_active = False  # 日志刷新状态
+        self.more_setting_refresh_active = False
+        self.gpu_var = None
+        self.keyboard_light_var = None
+        self.kl_auto_off_var = None
+        self.kl_color_var = None
+        self.kl_bright_var = None
+        self.ambient_light_var = None
+        self.al_color_var = None
+        self.al_bright_var = None
+        self.brightness_var = None
+        self.charge_var = None
+        self.charge_start_var = None
+        self.charge_stop_var = None
+        self.charge_custom_widgets = None
+        self.win_key_var = None
+        self.kl_color_name = None
+        self.al_color_name = None
+        self.more_setting_init = False
 
         # 模式映射（UI显示文本 → 内部模式代码）
         self.fan_mode_mapping = {
@@ -425,6 +504,7 @@ class FanCurveGUI:
         self.style.configure("Accent.TButton", foreground="#e74c3c", font=("微软雅黑", 16, "bold"))
         self.style.configure("TLabelframe.Label", font=("微软雅黑", 18))
         self.style.configure("Custom.TRadiobutton", font=('SimHei', 16))
+        self.style.configure("Custom.TCheckbutton", font=('SimHei', 16))
         self.style.configure("Custom.TButton", font=('SimHei', 16))
 
         # 实时状态变量
@@ -464,7 +544,7 @@ class FanCurveGUI:
             self.start_monitoring()
 
             # 初始化模式选择状态
-            self.fan_mode_var.set("自定义模式")
+            self.fan_mode_var.set("自定义模式" if self.controller.current_fan_mode == "manual" else "自动模式")
             self.full_mode_choice.set("关")
             self.switch_fan_mode()
 
@@ -668,6 +748,9 @@ class FanCurveGUI:
         # 底部操作区
         footer_frame = ttk.Frame(main_container)
         footer_frame.pack(fill="x", pady=10)
+
+        ttk.Button(footer_frame, text="更多设置", command=self.view_more_setting, style="Custom.TButton").pack(
+            side="left", padx=5)
 
         ttk.Button(footer_frame, text="查看日志", command=self.view_current_log, style="Custom.TButton").pack(
             side="right", padx=5)
@@ -1140,6 +1223,9 @@ class FanCurveGUI:
                 # 同步同速模式状态
                 self._sync_same_speed_status()
 
+                # 同步更多设置
+                self._sync_more_setting()
+
                 # 获取温度和转速
                 temps = self.controller.get_temperatures()
                 speeds = self.controller.get_fan_speeds()
@@ -1214,10 +1300,411 @@ class FanCurveGUI:
         """同步同速模式状态"""
         self.same_speed_choice.set("开" if self.controller.same_speed else "关")
 
+    def _sync_more_setting(self):
+        """同步更多设置"""
+
     def _update_perf_mode_buttons(self):
         """更新性能模式按钮样式"""
         for btn_name, btn in self.sys_mode_buttons.items():
             btn.config(style="Accent.TButton" if btn_name == self.controller.current_perf_mode else "TButton")
+
+    def view_more_setting(self):
+        """查看更多设置"""
+        try:
+            # 避免重复创建窗口
+            if hasattr(self, "more_window") and self.more_window:
+                if self.more_window.winfo_exists():
+                    self.more_window.lift()
+                return
+
+            # 创建子窗口
+            self.more_window = tk.Toplevel(self.root)
+            self.more_window.title("更多设置")
+            self.more_window.geometry("1000x600")
+            self.more_window.minsize(800, 600)
+
+            # 窗口关闭处理
+            def on_close():
+                self.stop_more_setting_refresh()
+                self.more_window.destroy()
+                delattr(self, "more_window")  # 释放属性
+
+            self.more_window.protocol("WM_DELETE_WINDOW", on_close)
+            # ========== 主容器（左右分栏，模拟图片布局） ==========
+            main_frame = ttk.Frame(self.more_window, padding=10)
+            main_frame.pack(fill="both", expand=True)
+
+            # 左侧容器：/显卡连接/键盘灯光/氛围灯光
+            left_frame = ttk.Frame(main_frame)
+            left_frame.pack(side="left", fill="both", expand=True, padx=5, pady=5)
+            # 右侧容器
+            right_frame = ttk.Frame(main_frame)
+            right_frame.pack(side="left", fill="both", expand=True, padx=5, pady=5)
+
+            # 显卡连接模块
+            gpu_frame = ttk.LabelFrame(left_frame, text="显卡连接", padding=10)
+            gpu_frame.pack(fill="x", padx=5, pady=5)
+
+            # 单选框：混合模式/独显直连/集显模式
+            gpu_mode = self.controller.gpu_mode_map[self.controller.wmi.GetGPUMode()]
+            self.gpu_var = tk.StringVar(value=gpu_mode)
+            gpu_radio1 = ttk.Radiobutton(gpu_frame, text="混合模式", variable=self.gpu_var, value="混合模式",
+                                         style="Custom.TRadiobutton", command=self.switch_gpu_mode)
+            gpu_radio1.pack(side="left", padx=10, pady=5)
+            gpu_radio2 = ttk.Radiobutton(gpu_frame, text="独显直连", variable=self.gpu_var, value="独显直连",
+                                         style="Custom.TRadiobutton", command=self.switch_gpu_mode)
+            gpu_radio2.pack(side="left", padx=10, pady=5)
+            gpu_radio3 = ttk.Radiobutton(gpu_frame, text="集显模式", variable=self.gpu_var, value="集显模式",
+                                         style="Custom.TRadiobutton", command=self.switch_gpu_mode)
+            gpu_radio3.pack(side="left", padx=10, pady=5)
+
+            # 键盘灯光模块（最优布局）
+            keyboard_light_frame = ttk.LabelFrame(left_frame, text="键盘灯光", padding=8)
+            keyboard_light_frame.pack(fill="x", padx=5, pady=3)
+
+            # 第一行：单选框 + 自动熄灯开关（同行排列）
+            kl_top_frame = ttk.Frame(keyboard_light_frame)
+            kl_top_frame.pack(fill="x", padx=5, pady=2)
+
+            kmode, kcolor, klight = self.controller.keyboard
+            # 单选框（缩小间距）
+            self.keyboard_light_var = tk.StringVar(value=kmode)
+            kl_radio1 = ttk.Radiobutton(kl_top_frame, text="关闭", variable=self.keyboard_light_var, value="关闭",
+                                        style="Custom.TRadiobutton", command=self.set_keyboard_light)
+            kl_radio1.pack(side="left", padx=5, pady=2)
+            kl_radio2 = ttk.Radiobutton(kl_top_frame, text="常亮", variable=self.keyboard_light_var, value="常亮",
+                                        style="Custom.TRadiobutton", command=self.set_keyboard_light)
+            kl_radio2.pack(side="left", padx=5, pady=2)
+            kl_radio3 = ttk.Radiobutton(kl_top_frame, text="呼吸", variable=self.keyboard_light_var, value="呼吸",
+                                        style="Custom.TRadiobutton", command=self.set_keyboard_light)
+            kl_radio3.pack(side="left", padx=5, pady=2)
+            kl_radio4 = ttk.Radiobutton(kl_top_frame, text="渐变", variable=self.keyboard_light_var, value="渐变",
+                                        style="Custom.TRadiobutton", command=self.set_keyboard_light)
+            kl_radio4.pack(side="left", padx=5, pady=2)
+
+            # 自动熄灯开关（紧跟单选框右侧，同行）
+            self.kl_auto_off_var = tk.BooleanVar(value=self.controller.auto_close_light)
+            kl_auto_off_check = ttk.Checkbutton(kl_top_frame, text="自动熄灯", variable=self.kl_auto_off_var,
+                                                style="Custom.TCheckbutton", command=self.set_auto_close_light)
+            kl_auto_off_check.pack(side="left", padx=10, pady=2)  # 与单选框保持小间距
+
+            # 第二行：颜色 + 亮度（换行，压缩宽度）
+            kl_bottom_frame = ttk.Frame(keyboard_light_frame)
+            kl_bottom_frame.pack(fill="x", padx=5, pady=10)
+
+            # 颜色选择（宽度8）
+            ttk.Label(kl_bottom_frame, text="颜色:").pack(side="left", padx=3)
+            self.kl_color_var = tk.StringVar(value=kcolor)
+            kl_color_combo = ColorUtils.ColorCombobox(
+                kl_bottom_frame,
+                textvariable=self.kl_color_var,
+                color_names=list(ColorUtils.Color.keys()),
+                command=self.set_keyboard_light
+            )
+            kl_color_combo.pack(side="left", padx=3)
+
+            # 亮度选择（宽度6）
+            ttk.Label(kl_bottom_frame, text="亮度:").pack(side="left", padx=10)
+            self.kl_bright_var = tk.StringVar(value=klight)
+            kl_bright_combo = ttk.Combobox(
+                kl_bottom_frame,
+                textvariable=self.kl_bright_var,
+                values=[f"亮度{str(i)}" for i in range(0, 5)],
+                state="readonly",
+                width=6
+            )
+            kl_bright_combo.bind("<<ComboboxSelected>>", self.set_keyboard_light)
+            kl_bright_combo.pack(side="left", padx=3)
+
+            # 氛围灯光模块（优化布局+压缩宽度）
+            ambient_light_frame = ttk.LabelFrame(left_frame, text="氛围灯光", padding=8)  # 减小内边距
+            ambient_light_frame.pack(fill="x", padx=5, pady=3)  # 减小外边距
+
+            # 第一行：单选框（封装到Frame+缩小间距）
+            al_radio_frame = ttk.Frame(ambient_light_frame)
+            al_radio_frame.pack(fill="x", padx=5, pady=2)
+
+            amode, acolor, alight = self.controller.led
+            self.ambient_light_var = tk.StringVar(value=amode)
+            al_radio1 = ttk.Radiobutton(al_radio_frame, text="关闭", variable=self.ambient_light_var, value="关闭",
+                                        style="Custom.TRadiobutton", command=self.set_led_light)
+            al_radio1.pack(side="left", padx=5, pady=2)  # padx从10→5，压缩横向间距
+            al_radio2 = ttk.Radiobutton(al_radio_frame, text="常亮", variable=self.ambient_light_var, value="常亮",
+                                        style="Custom.TRadiobutton", command=self.set_led_light)
+            al_radio2.pack(side="left", padx=5, pady=2)
+            al_radio3 = ttk.Radiobutton(al_radio_frame, text="呼吸", variable=self.ambient_light_var, value="呼吸",
+                                        style="Custom.TRadiobutton", command=self.set_led_light)
+            al_radio3.pack(side="left", padx=5, pady=2)
+            al_radio4 = ttk.Radiobutton(al_radio_frame, text="渐变", variable=self.ambient_light_var, value="渐变",
+                                        style="Custom.TRadiobutton", command=self.set_led_light)
+            al_radio4.pack(side="left", padx=5, pady=2)
+
+            # 第二行：颜色+亮度（压缩下拉框宽度）
+            al_subframe = ttk.Frame(ambient_light_frame)
+            al_subframe.pack(fill="x", padx=5, pady=10)
+
+            # 颜色选择（宽度从10→8）
+            ttk.Label(al_subframe, text="颜色:", style="Custom.TLabel").pack(side="left", padx=3)  # padx从5→3
+            self.al_color_var = tk.StringVar(value=acolor)
+            al_color_combo = ColorUtils.ColorCombobox(
+                al_subframe,
+                textvariable=self.al_color_var,
+                color_names=list(ColorUtils.Color.keys()),
+                command=self.set_led_light
+            )
+            al_color_combo.pack(side="left", padx=3)
+
+            # 亮度选择（宽度从10→6）
+            ttk.Label(al_subframe, text="亮度:", style="Custom.TLabel").pack(side="left", padx=10)
+            self.al_bright_var = tk.StringVar(value=alight)
+            al_bright_combo = ttk.Combobox(
+                al_subframe,
+                textvariable=self.al_bright_var,
+                values=[f"亮度{str(i)}" for i in range(0, 5)],
+                state="readonly",
+                width=6  # 大幅压缩宽度
+            )
+            al_bright_combo.bind("<<ComboboxSelected>>", self.set_led_light)
+            al_bright_combo.pack(side="left", padx=3)
+
+            # 屏幕亮度模块（优化布局+压缩宽度）
+            brightness_frame = ttk.LabelFrame(left_frame, text="屏幕亮度", padding=8)  # 减小内边距
+            brightness_frame.pack(fill="x", padx=5, pady=3)  # 减小外边距
+
+            # 第一行：滑块 + 数值显示（压缩滑块长度）
+            bright_slider_frame = ttk.Frame(brightness_frame)
+            bright_slider_frame.pack(fill="x", padx=5, pady=2)
+
+            self.brightness_var = tk.IntVar(value=self.controller.wmi.GetScreenBrightness())
+            # 滑块长度从300→200，大幅压缩横向宽度
+            bright_scale = ttk.Scale(
+                bright_slider_frame,
+                from_=0,
+                to=100,
+                variable=self.brightness_var,
+                orient="horizontal",
+                command=self.set_screen_brightness,
+                length=200  # 核心：缩短滑块长度
+            )
+            bright_scale.pack(side="left", padx=5, pady=2)  # padx从10→5
+            bright_label = ttk.Label(bright_slider_frame, textvariable=self.brightness_var, width=3)
+            bright_label.pack(side="left", padx=3)  # padx从5→3
+
+            # 第二行：快捷键说明（单独一行，避免横向拥挤）
+            bright_tip_frame = ttk.Frame(brightness_frame)
+            bright_tip_frame.pack(fill="x", padx=5, pady=2)
+
+            # 提示文字换行显示（可选：缩短单行长度）
+            ttk.Label(
+                bright_tip_frame,
+                text="快捷键  Fn+F11 降低亮度  Fn+F12 提高亮度",
+                font=("微软雅黑", 10),
+                wraplength=300  # 超过200像素自动换行，避免单行过长
+            ).pack(anchor="w", padx=5, pady=2)  # padx从10→5，pady从5→2
+
+            # 充电选择模块
+            charge_frame = ttk.LabelFrame(right_frame, text="充电选择", padding=10)
+            charge_frame.pack(fill="x", padx=5, pady=10)
+
+            # 单选框：最大电池电量/推荐电池充电/自定义充电
+            self.charge_var = tk.StringVar(value=self.controller.charging_mode)
+            charge_radio1 = ttk.Radiobutton(charge_frame, text="最大电池电量", variable=self.charge_var,
+                                            value="最大电池电量", style="Custom.TRadiobutton",
+                                            command=self.set_charge_mode)
+            charge_radio1.pack(anchor="w", padx=10, pady=10)
+            ttk.Label(charge_frame, text="持续将电池充电至 100%", font=("微软雅黑", 10)).pack(anchor="w", padx=20)
+
+            charge_radio2 = ttk.Radiobutton(charge_frame, text="推荐电池充电", variable=self.charge_var,
+                                            value="推荐电池充电", style="Custom.TRadiobutton",
+                                            command=self.set_charge_mode)
+            charge_radio2.pack(anchor="w", padx=10, pady=10)
+            ttk.Label(charge_frame, text="低于70%充电, 80%停止", font=("微软雅黑", 10)).pack(anchor="w", padx=20)
+
+            charge_radio3 = ttk.Radiobutton(charge_frame, text="自定义充电", variable=self.charge_var,
+                                            value="自定义充电", style="Custom.TRadiobutton",
+                                            command=self.set_charge_mode)
+            charge_radio3.pack(anchor="w", padx=10, pady=10)
+            ttk.Label(charge_frame, text="设置启动和停止充电阈值", font=("微软雅黑", 10)).pack(anchor="w", padx=20)
+
+            # 自定义充电阈值（默认禁用，优化布局）
+            self.charge_custom_frame = ttk.Frame(charge_frame)
+            self.charge_custom_frame.pack(anchor="w", padx=20, pady=10)  # 减小pady
+
+            # 存储自定义充电区域的组件，用于批量禁用/启用
+            self.charge_custom_widgets = []
+
+            # 第一行：不足时开始充电（单独一行）
+            charge_start_frame = ttk.Frame(self.charge_custom_frame)
+            charge_start_frame.pack(fill="x", padx=0, pady=10)
+
+            start_label = ttk.Label(charge_start_frame, text="不足时开始充电:")
+            start_label.pack(side="left", padx=3)  # padx从5→3
+            self.charge_custom_widgets.append(start_label)
+
+            self.charge_start_var = tk.IntVar(value=80)
+            charge_start_combo = ttk.Combobox(
+                charge_start_frame,
+                textvariable=self.charge_start_var,
+                values=[str(i * 10) for i in range(4, 10)],
+                width=6  # 宽度从10→6，大幅压缩,
+            )
+            charge_start_combo.config(state="readonly" if self.charge_var.get() == "自定义充电" else "disabled")
+            charge_start_combo.bind("<<ComboboxSelected>>", self.set_charge_threshold)
+            charge_start_combo.pack(side="left", padx=3)
+            self.charge_custom_widgets.append(charge_start_combo)
+
+            # 第二行：达到时停止充电（单独一行）
+            charge_stop_frame = ttk.Frame(self.charge_custom_frame)
+            charge_stop_frame.pack(fill="x", padx=0, pady=10)
+
+            stop_label = ttk.Label(charge_stop_frame, text="达到时停止充电:")
+            stop_label.pack(side="left", padx=3)
+            self.charge_custom_widgets.append(stop_label)
+
+            self.charge_stop_var = tk.IntVar(value=100)
+            charge_stop_combo = ttk.Combobox(
+                charge_stop_frame,
+                textvariable=self.charge_stop_var,
+                values=[str(i * 10) for i in range(5, 11)],
+                width=6  # 宽度从10→6
+            )
+            charge_stop_combo.config(state="readonly" if self.charge_var.get() == "自定义充电" else "disabled")
+            charge_stop_combo.bind("<<ComboboxSelected>>", self.set_charge_threshold)
+            charge_stop_combo.pack(side="left", padx=3)
+            self.charge_custom_widgets.append(charge_stop_combo)
+
+            # Win键开关
+            win_key_frame = ttk.Frame(self.more_window)
+            win_key_frame.place(relx=1.0, rely=0.0, anchor="ne", x=-10, y=10)
+
+            self.win_key_var = tk.BooleanVar(value=self.controller.win_lock)
+            win_key_check = ttk.Checkbutton(win_key_frame, text="Win键开关", variable=self.win_key_var,
+                                            style="Custom.TCheckbutton", command=self.switch_win_lock)
+            win_key_check.pack()
+
+            self.refresh_more_setting_content()
+            self.start_more_setting_refresh()
+
+        except Exception as e:
+            error_msg = f"打开更多设置失败：{str(e)}"
+            self.logger.error(error_msg)
+            messagebox.showerror("失败", error_msg)
+
+    def switch_gpu_mode(self):
+        mode = self.controller.wmi.GetGPUMode()
+        if messagebox.askyesno("提示", "显卡连接需要重启电脑生效，是否现在重启？", parent=self.more_window):
+            for key, value in self.controller.gpu_mode_map.items():
+                if self.gpu_var.get() == value:
+                    mode = key
+            self.controller.wmi.SetGPUMode(mode)
+            self.controller.win32.RestartComputer(r"iGameAPI\\N15_25\\FPT\\FPTW64_8105.exe")
+        else:
+            self.gpu_var.set(self.controller.gpu_mode_map[mode])
+
+    def set_charge_mode(self):
+        for widget in self.charge_custom_widgets:
+            widget.config(state="readonly" if self.charge_var.get() == "自定义充电" else "disabled")
+        if self.charge_var.get() == "最大电池电量":
+            self.controller.wmi.ChargingOptimize(False)
+            self.controller.wmi.SetBatteryMax(100)
+        if self.charge_var.get() == "推荐电池充电":
+            self.controller.wmi.ChargingOptimize(True)
+            self.controller.wmi.SetBatteryMin(70)
+            self.controller.wmi.SetBatteryMax(80)
+        if self.charge_var.get() == "自定义充电":
+            self.controller.wmi.ChargingOptimize(True)
+            self.controller.wmi.SetBatteryMin(self.charge_start_var.get())
+            self.controller.wmi.SetBatteryMax(self.charge_stop_var.get())
+
+    def set_charge_threshold(self, *args):
+        """阈值修正：最小≥最大时，强制设min=0、max=100"""
+        try:
+            # 获取当前选中值并转整数
+            selected_min = self.charge_start_var.get()
+            selected_max = self.charge_stop_var.get()
+        except (ValueError, AttributeError):
+            selected_min = 40
+            selected_max = 100
+
+        if selected_min > selected_max:
+            selected_max = 100
+
+        # 同步修正后的值到界面变量
+        self.charge_start_var.set(selected_min)
+        self.charge_stop_var.set(selected_max)
+
+        self.controller.wmi.ChargingOptimize(True)
+        self.controller.wmi.SetBatteryMin(self.charge_start_var.get())
+        self.controller.wmi.SetBatteryMax(self.charge_stop_var.get())
+
+    def set_screen_brightness(self, value):
+        if self.brightness_var:
+            self.controller.wmi.SetScreenBrightness(self.brightness_var.get())
+
+    def set_led_light(self, *args):
+        current_mode = self.ambient_light_var.get()  # 氛围灯模式（关闭/常亮/呼吸/渐变）
+        current_color = self.al_color_var.get()  # 氛围灯颜色
+        current_light = self.al_bright_var.get()  # 氛围灯亮度
+
+        # 同步到控制器（更新为最新值）
+        self.controller.led = [current_mode, current_color, current_light]
+
+        # 调用生效逻辑（此时传入的是最新值）
+        self.controller.light_switch(1, current_mode, current_color, current_light)
+        self.logger.info(f"氛围灯设置生效：模式={current_mode}, 颜色={current_color}, 亮度={current_light}")
+
+    def set_keyboard_light(self, *args):
+        # 从界面控件读取最新值（核心修改）
+        current_mode = self.keyboard_light_var.get()  # 键盘灯模式
+        current_color = self.kl_color_var.get()  # 键盘灯颜色
+        current_light = self.kl_bright_var.get()  # 键盘灯亮度
+
+        # 同步到控制器（更新为最新值）
+        self.controller.keyboard = [current_mode, current_color, current_light]
+
+        # 调用生效逻辑（此时传入的是最新值）
+        self.controller.light_switch(0, current_mode, current_color, current_light)
+        self.logger.info(f"键盘灯设置生效：模式={current_mode}, 颜色={current_color}, 亮度={current_light}")
+
+    def switch_win_lock(self):
+        if self.win_key_var.get():
+            self.controller.win32.SetWinkeyLock(False)
+            self.logger.info("更多设置：Win键已打开")
+        else:
+            self.controller.win32.SetWinkeyLock(True)
+            self.logger.info("更多设置：Win键已关闭")
+
+    def set_auto_close_light(self):
+        if self.kl_auto_off_var.get():
+            self.controller.mcu.AutoCloselight(True)
+        else:
+            self.controller.mcu.AutoCloselight(False)
+
+    def start_more_setting_refresh(self):
+        """启动日志刷新"""
+        if not self.more_setting_refresh_active:
+            self.more_setting_refresh_active = True
+            self.more_setting_refresh_loop()
+
+    def stop_more_setting_refresh(self):
+        """停止日志刷新"""
+        self.more_setting_refresh_active = False
+        self.controller.save_config()
+
+    def more_setting_refresh_loop(self):
+        """日志刷新循环"""
+        if self.more_setting_refresh_active and self.more_window and self.more_window.winfo_exists():
+            self.refresh_more_setting_content()
+            self.root.after(500, self.more_setting_refresh_loop)  # 500ms刷新一次
+
+    def refresh_more_setting_content(self):
+        if self.brightness_var:
+            self.brightness_var.set(self.controller.wmi.GetScreenBrightness())
+        self.controller.win_lock = self.win_key_var.get()
+        self.controller.auto_close_light = self.kl_auto_off_var.get()
+        self.controller.keyboard = [self.keyboard_light_var.get(), self.kl_color_var.get(), self.kl_bright_var.get()]
+        self.controller.led = [self.ambient_light_var.get(), self.al_color_var.get(), self.al_bright_var.get()]
+        self.controller.charging_mode = self.charge_var.get()
 
     def view_current_log(self):
         """查看当前日志"""
