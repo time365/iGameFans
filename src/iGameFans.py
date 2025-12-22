@@ -18,6 +18,7 @@ import winreg
 import sys
 from task import Task
 import ColorUtils
+from ColorUtilsPlus import *
 import math
 
 plt.rcParams['font.sans-serif'] = ["SimHei"]  # 设置字体为黑体
@@ -188,8 +189,8 @@ class FanController:
             self.is_full_mode = config.get("IsFullMode", False)
             self.same_speed = config.get("SameSpeed", False)
             self.last_non_full_mode = config.get("LastNonFullMode", "auto")
-            self.keyboard = config.get("Keyboard", ["渐变", "DBlue", "亮度4"])
-            self.led = config.get("Led", ["渐变", "DBlue", "亮度4"])
+            self.keyboard = config.get("Keyboard", ["渐变", "#ff0000", "亮度4"])
+            self.led = config.get("Led", ["渐变", "#ff0000", "亮度4"])
             self.win_lock = config.get("WinLock", False)
             self.auto_close_light = config.get("AutoCloseLight", False)
             self.charging_mode = config.get("ChargingMode", "最大电池电量")
@@ -453,6 +454,29 @@ class FanController:
             self.mcu.LightSwitch(region, command["打开"], r, g, b, level[light])
             self.mcu.LightSwitch(region, command[mode], r, g, b, level[light])
 
+    def light_switch_plus(self, region, mode, color, light):
+        level = {
+            "亮度0": 0,
+            "亮度1": int(255 / 4),
+            "亮度2": int(255 / 3),
+            "亮度3": int(255 / 2),
+            "亮度4": int(255 / 1),
+        }
+        command = {
+            "关闭": 0,
+            "打开": 1,
+            "常亮": 2,
+            "呼吸": 3,
+            "渐变": 4
+        }
+        r, g, b = ColorConverter.tk_color_to_rgb(color)
+
+        if mode == "关闭":
+            self.mcu.LightSwitch(region, command[mode], r, g, b, level[light])
+        else:
+            self.mcu.LightSwitch(region, command["打开"], r, g, b, level[light])
+            self.mcu.LightSwitch(region, command[mode], r, g, b, level[light])
+
 
 class FanCurveGUI:
     """
@@ -469,10 +493,12 @@ class FanCurveGUI:
         self.log_refresh_active = False  # 日志刷新状态
         self.more_setting_refresh_active = False
         self.gpu_var = None
+        self.kl_color_widget =  None
         self.keyboard_light_var = None
         self.kl_auto_off_var = None
         self.kl_color_var = None
         self.kl_bright_var = None
+        self.al_color_widget =  None
         self.ambient_light_var = None
         self.al_color_var = None
         self.al_bright_var = None
@@ -482,6 +508,7 @@ class FanCurveGUI:
         self.charge_stop_var = None
         self.charge_custom_widgets = None
         self.win_key_var = None
+        self.fn_key_var = None
         self.kl_color_name = None
         self.al_color_name = None
         self.more_setting_init = False
@@ -528,9 +555,16 @@ class FanCurveGUI:
         self.edit_gpu_curve = self.controller.applied_gpu_curve.copy()
 
         # 初始化界面
-        self.root.title("iGame风扇控制 V1.1")
-        self.root.geometry("1400x800")
-        self.root.minsize(1200, 800)
+        self.root.title("iGame风扇控制 V1.2")
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        width, height = (1200, 800)
+        # 计算窗口左上角的x、y坐标
+        x = int((screen_width - width) / 2)
+        y = int((screen_height - height) / 2)
+        # 设置窗口大小和位置（格式：宽x高+x+y）
+        self.root.geometry(f"{width}x{height}+{x}+{y}")
+        self.root.minsize(width, height)
         self.root.resizable(True, True)
 
         # 创建界面组件
@@ -597,7 +631,7 @@ class FanCurveGUI:
         sys_mode_grid = ttk.Frame(sys_mode_card)
         sys_mode_grid.pack(fill="x")
 
-        ttk.Label(sys_mode_grid, text="选择性能模式：", style="Header.TLabel").pack(side="left", padx=(0, 15))
+        ttk.Label(sys_mode_grid, text="选择性能模式：", style="Header.TLabel").pack(side="left", padx=(0, 0))
         self.sys_mode_buttons = {}
         for mode in ["狂暴模式", "静音游戏", "超长续航"]:
             btn = ttk.Button(
@@ -617,7 +651,7 @@ class FanCurveGUI:
         fan_mode_grid.pack(fill="x")
 
         # 基础风扇模式选择
-        ttk.Label(fan_mode_grid, text="基础模式：", style="Header.TLabel").pack(side="left", padx=(0, 15))
+        ttk.Label(fan_mode_grid, text="基础模式：", style="Header.TLabel").pack(side="left", padx=(0, 0))
         ttk.Radiobutton(
             fan_mode_grid,
             text="自动模式",
@@ -625,7 +659,7 @@ class FanCurveGUI:
             value="自动模式",
             command=self.switch_fan_mode,
             style="Custom.TRadiobutton"
-        ).pack(side="left", padx=10)
+        ).pack(side="left", padx=5)
 
         ttk.Radiobutton(
             fan_mode_grid,
@@ -634,10 +668,10 @@ class FanCurveGUI:
             value="自定义模式",
             command=self.switch_fan_mode,
             style="Custom.TRadiobutton"
-        ).pack(side="left", padx=10)
+        ).pack(side="left", padx=5)
 
         # 强冷模式开/关选项
-        ttk.Label(fan_mode_grid, text="强冷模式：", style="Header.TLabel").pack(side="left", padx=(20, 15))
+        ttk.Label(fan_mode_grid, text="强冷模式：", style="Header.TLabel").pack(side="left", padx=(20, 0))
         ttk.Radiobutton(
             fan_mode_grid,
             text="开",
@@ -691,7 +725,7 @@ class FanCurveGUI:
         threshold_frame = ttk.Frame(config_card)
         threshold_frame.pack(fill="x", pady=(0, 10))
 
-        ttk.Label(threshold_frame, text="低温自动切换阈值：", style="Header.TLabel").pack(side="left", padx=(0, 10))
+        ttk.Label(threshold_frame, text="低温自动切换阈值：", style="Header.TLabel").pack(side="left", padx=(0, 0))
         self.threshold_entry = ttk.Entry(threshold_frame, width=5, font=("微软雅黑", 13))
         self.threshold_entry.insert(0, str(self.controller.low_temp_threshold))
         self.threshold_entry.pack(side="left", padx=(0, 5))
@@ -701,9 +735,9 @@ class FanCurveGUI:
 
         # 同速模式
         same_speed_frame = ttk.Frame(config_card)
-        same_speed_frame.pack(fill="x", pady=(0, 10))
+        same_speed_frame.pack(fill="x", pady=(0, 0))
 
-        ttk.Label(same_speed_frame, text="同速模式：", style="Header.TLabel").pack(side="left", padx=(0, 15))
+        ttk.Label(same_speed_frame, text="同速模式：", style="Header.TLabel").pack(side="left", padx=(0, 0))
         self.same_speed_choice_open = ttk.Radiobutton(
             same_speed_frame,
             text="开",
@@ -728,7 +762,7 @@ class FanCurveGUI:
         config_buttons_frame = ttk.Frame(config_card)
         config_buttons_frame.pack(fill="x", pady=(10, 0))
 
-        ttk.Label(config_buttons_frame, text="配置管理：", style="Header.TLabel").pack(side="left", padx=(0, 10))
+        ttk.Label(config_buttons_frame, text="配置管理：", style="Header.TLabel").pack(side="left", padx=(0, 0))
         # self.load_config_btn = ttk.Button(config_buttons_frame, text="加载配置", command=self.load_config,style="Custom.TButton")
         # self.load_config_btn.pack(side="left", padx=5)
         # self.save_as_config_btn = ttk.Button(config_buttons_frame, text="另存为...",
@@ -736,7 +770,16 @@ class FanCurveGUI:
         # self.save_as_config_btn.pack(side="left", padx=5)
         self.restore_default_btn = ttk.Button(config_buttons_frame, text="恢复默认",
                                               command=self.restore_default_config, style="Custom.TButton")
-        self.restore_default_btn.pack(side="left", padx=5)
+        self.restore_default_btn.pack(side="left", padx=0)
+
+        more_setting_buttons_frame = ttk.Frame(config_card)
+        more_setting_buttons_frame.pack(fill="x", pady=(10, 0))
+
+        ttk.Label(more_setting_buttons_frame, text="控制中心：", style="Header.TLabel").pack(side="left", padx=(0, 0))
+        ttk.Button(more_setting_buttons_frame, text="更多设置", command=self.view_more_setting, style="Custom.TButton").pack(
+            side="left", padx=0)
+
+
 
         # 右侧：曲线预览卡片
         plot_card = ttk.LabelFrame(content_frame, text="曲线预览", padding="10 10 10 10")
@@ -749,8 +792,6 @@ class FanCurveGUI:
         footer_frame = ttk.Frame(main_container)
         footer_frame.pack(fill="x", pady=10)
 
-        ttk.Button(footer_frame, text="更多设置", command=self.view_more_setting, style="Custom.TButton").pack(
-            side="left", padx=5)
 
         ttk.Button(footer_frame, text="查看日志", command=self.view_current_log, style="Custom.TButton").pack(
             side="right", padx=5)
@@ -1320,8 +1361,15 @@ class FanCurveGUI:
             # 创建子窗口
             self.more_window = tk.Toplevel(self.root)
             self.more_window.title("更多设置")
-            self.more_window.geometry("1000x600")
-            self.more_window.minsize(800, 600)
+            screen_width =  self.more_window.winfo_screenwidth()
+            screen_height = self.more_window.winfo_screenheight()
+            width, height=(1080,720)
+            # 计算窗口左上角的x、y坐标
+            x = int((screen_width - width) / 2)
+            y = int((screen_height - height) / 2)
+            # 设置窗口大小和位置（格式：宽x高+x+y）
+            self.more_window.geometry(f"{width}x{height}+{x}+{y}")
+            self.more_window.minsize(width, height)
 
             # 窗口关闭处理
             def on_close():
@@ -1395,13 +1443,13 @@ class FanCurveGUI:
             # 颜色选择（宽度8）
             ttk.Label(kl_bottom_frame, text="颜色:").pack(side="left", padx=3)
             self.kl_color_var = tk.StringVar(value=kcolor)
-            kl_color_combo = ColorUtils.ColorCombobox(
+            # 创建自定义颜色选择器（默认红色 #ff0000）
+            self.kl_color_widget = ColorChooserWidget(
                 kl_bottom_frame,
-                textvariable=self.kl_color_var,
-                color_names=list(ColorUtils.Color.keys()),
+                default_color=kcolor,  # 默认红色
                 command=self.set_keyboard_light
             )
-            kl_color_combo.pack(side="left", padx=3)
+            self.kl_color_widget.pack(side="left", padx=3)
 
             # 亮度选择（宽度6）
             ttk.Label(kl_bottom_frame, text="亮度:").pack(side="left", padx=10)
@@ -1446,13 +1494,13 @@ class FanCurveGUI:
             # 颜色选择（宽度从10→8）
             ttk.Label(al_subframe, text="颜色:", style="Custom.TLabel").pack(side="left", padx=3)  # padx从5→3
             self.al_color_var = tk.StringVar(value=acolor)
-            al_color_combo = ColorUtils.ColorCombobox(
+            # 创建自定义颜色选择器（默认红色 #ff0000）
+            self.al_color_widget = ColorChooserWidget(
                 al_subframe,
-                textvariable=self.al_color_var,
-                color_names=list(ColorUtils.Color.keys()),
+                default_color=acolor,  # 默认红色
                 command=self.set_led_light
             )
-            al_color_combo.pack(side="left", padx=3)
+            self.al_color_widget.pack(side="left", padx=3)
 
             # 亮度选择（宽度从10→6）
             ttk.Label(al_subframe, text="亮度:", style="Custom.TLabel").pack(side="left", padx=10)
@@ -1573,6 +1621,16 @@ class FanCurveGUI:
             charge_stop_combo.pack(side="left", padx=3)
             self.charge_custom_widgets.append(charge_stop_combo)
 
+            # Fn键开关
+            # fn_key_frame = ttk.Frame(self.more_window)
+            # fn_key_frame.place(relx=1.0, rely=0.0, anchor="ne", x=-150, y=10)
+            #
+            # print("Fn键状态：", self.controller.wmi.GetFnkeyLock())
+            # self.fn_key_var = tk.BooleanVar(value=self.controller.wmi.GetFnkeyLock())
+            # fn_key_check = ttk.Checkbutton(fn_key_frame, text="Fn键开关", variable=self.fn_key_var,
+            #                                 style="Custom.TCheckbutton", command=self.switch_fn_lock)
+            # fn_key_check.pack()
+
             # Win键开关
             win_key_frame = ttk.Frame(self.more_window)
             win_key_frame.place(relx=1.0, rely=0.0, anchor="ne", x=-10, y=10)
@@ -1643,27 +1701,26 @@ class FanCurveGUI:
 
     def set_led_light(self, *args):
         current_mode = self.ambient_light_var.get()  # 氛围灯模式（关闭/常亮/呼吸/渐变）
-        current_color = self.al_color_var.get()  # 氛围灯颜色
+        current_color = self.al_color_widget.get_selected()  # 氛围灯颜色
         current_light = self.al_bright_var.get()  # 氛围灯亮度
-
         # 同步到控制器（更新为最新值）
         self.controller.led = [current_mode, current_color, current_light]
 
         # 调用生效逻辑（此时传入的是最新值）
-        self.controller.light_switch(1, current_mode, current_color, current_light)
+        self.controller.light_switch_plus(1, current_mode, current_color, current_light)
         self.logger.info(f"氛围灯设置生效：模式={current_mode}, 颜色={current_color}, 亮度={current_light}")
 
     def set_keyboard_light(self, *args):
         # 从界面控件读取最新值（核心修改）
         current_mode = self.keyboard_light_var.get()  # 键盘灯模式
-        current_color = self.kl_color_var.get()  # 键盘灯颜色
+        current_color = self.kl_color_widget.get_selected()  # 键盘灯颜色
         current_light = self.kl_bright_var.get()  # 键盘灯亮度
 
         # 同步到控制器（更新为最新值）
         self.controller.keyboard = [current_mode, current_color, current_light]
 
         # 调用生效逻辑（此时传入的是最新值）
-        self.controller.light_switch(0, current_mode, current_color, current_light)
+        self.controller.light_switch_plus(0, current_mode, current_color, current_light)
         self.logger.info(f"键盘灯设置生效：模式={current_mode}, 颜色={current_color}, 亮度={current_light}")
 
     def switch_win_lock(self):
@@ -1673,6 +1730,14 @@ class FanCurveGUI:
         else:
             self.controller.win32.SetWinkeyLock(True)
             self.logger.info("更多设置：Win键已关闭")
+
+    def switch_fn_lock(self):
+        if self.fn_key_var.get():
+            self.controller.wmi.SetFnkeyLock(True)
+            self.logger.info("更多设置：Fn键已打开")
+        else:
+            self.controller.wmi.SetFnkeyLock(False)
+            self.logger.info("更多设置：Fn键已关闭")
 
     def set_auto_close_light(self):
         if self.kl_auto_off_var.get():
@@ -1702,8 +1767,8 @@ class FanCurveGUI:
             self.brightness_var.set(self.controller.wmi.GetScreenBrightness())
         self.controller.win_lock = self.win_key_var.get()
         self.controller.auto_close_light = self.kl_auto_off_var.get()
-        self.controller.keyboard = [self.keyboard_light_var.get(), self.kl_color_var.get(), self.kl_bright_var.get()]
-        self.controller.led = [self.ambient_light_var.get(), self.al_color_var.get(), self.al_bright_var.get()]
+        self.controller.keyboard = [self.keyboard_light_var.get(), self.kl_color_widget.get_selected(), self.kl_bright_var.get()]
+        self.controller.led = [self.ambient_light_var.get(), self.al_color_widget.get_selected(), self.al_bright_var.get()]
         self.controller.charging_mode = self.charge_var.get()
 
     def view_current_log(self):
@@ -1726,8 +1791,15 @@ class FanCurveGUI:
             # 创建日志窗口
             self.log_window = tk.Toplevel(self.root)
             self.log_window.title(f"日志查看 - {os.path.basename(log_file)}")
-            self.log_window.geometry("1200x600")
-            self.log_window.minsize(1080, 400)
+            screen_width =  self.log_window.winfo_screenwidth()
+            screen_height = self.log_window.winfo_screenheight()
+            width, height=(1080,720)
+            # 计算窗口左上角的x、y坐标
+            x = int((screen_width - width) / 2)
+            y = int((screen_height - height) / 2)
+            # 设置窗口大小和位置（格式：宽x高+x+y）
+            self.log_window.geometry(f"{width}x{height}+{x}+{y}")
+            self.log_window.minsize(width, height)
 
             # 窗口关闭处理
             def on_close():

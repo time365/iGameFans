@@ -24,22 +24,22 @@
         83
     ],
     "LowTempThreshold": 20,
-    "CurrentFanMode": "auto",
-    "IsCustomMode": false,
+    "CurrentFanMode": "manual",
+    "IsCustomMode": true,
     "IsFullMode": false,
-    "LastNonFullMode": "auto",
+    "LastNonFullMode": "manual",
     "SameSpeed": false,
     "Keyboard": [
         "呼吸",
-        "White",
+        "#00ff40",
         "亮度4"
     ],
     "Led": [
         "呼吸",
-        "White",
+        "#ff0080",
         "亮度4"
     ],
-    "WinLock": false,
+    "WinLock": true,
     "AutoCloseLight": true,
-    "ChargingMode": "自定义充电"
+    "ChargingMode": "最大电池电量"
 }
