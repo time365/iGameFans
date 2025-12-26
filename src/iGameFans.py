@@ -16,10 +16,12 @@ import configparser
 import os
 import winreg
 import sys
-from task import Task
+from Task import Task
 import ColorUtils
 from ColorUtilsPlus import *
+from CurveUtils import FanCurveWidget
 import math
+from BackgroundUtils import BackgroundImageComponent
 
 plt.rcParams['font.sans-serif'] = ["SimHei"]  # 设置字体为黑体
 plt.rcParams['axes.unicode_minus'] = False  # 正常显示负号
@@ -493,12 +495,12 @@ class FanCurveGUI:
         self.log_refresh_active = False  # 日志刷新状态
         self.more_setting_refresh_active = False
         self.gpu_var = None
-        self.kl_color_widget =  None
+        self.kl_color_widget = None
         self.keyboard_light_var = None
         self.kl_auto_off_var = None
         self.kl_color_var = None
         self.kl_bright_var = None
-        self.al_color_widget =  None
+        self.al_color_widget = None
         self.ambient_light_var = None
         self.al_color_var = None
         self.al_bright_var = None
@@ -512,6 +514,11 @@ class FanCurveGUI:
         self.kl_color_name = None
         self.al_color_name = None
         self.more_setting_init = False
+        self.curve_widget = None
+        self.setting_config_path = get_file_path("conf", "config.ini")
+        self.setting_config = configparser.ConfigParser()
+        self.bg_image_path = None
+        self.bg_transparency = None
 
         # 模式映射（UI显示文本 → 内部模式代码）
         self.fan_mode_mapping = {
@@ -554,6 +561,9 @@ class FanCurveGUI:
         self.edit_cpu_curve = self.controller.applied_cpu_curve.copy()
         self.edit_gpu_curve = self.controller.applied_gpu_curve.copy()
 
+        # 加载配置文件
+        self.load_setting_config()
+
         # 初始化界面
         self.root.title("iGame风扇控制 V1.2")
         screen_width = self.root.winfo_screenwidth()
@@ -569,12 +579,12 @@ class FanCurveGUI:
 
         # 创建界面组件
         self._create_widgets()
-        self._init_plot()  # 初始化曲线图
+        # self._init_plot()  # 初始化曲线图
 
         # 启动初始化
         try:
             self._query_current_mode()
-            self._update_plot()
+            # self._update_plot()
             self.start_monitoring()
 
             # 初始化模式选择状态
@@ -596,11 +606,33 @@ class FanCurveGUI:
     def _create_widgets(self):
         """创建界面组件"""
         # 主容器
+        # bg_component = BackgroundImageComponent(
+        #     master=self.root,
+        #     bg_image_path=self.bg_image_path,
+        #     init_transparency=self.bg_transparency
+        # )
+
         main_container = ttk.Frame(self.root, padding="10 10 10 10")
         main_container.pack(fill="both", expand=True)
 
         # 顶部状态监控卡片
         status_card = ttk.LabelFrame(main_container, text="实时状态监控", padding="10 10 10 10")
+        status_card.pack(fill="x", pady=(0, 10))
+        #
+        style = ttk.Style(self.root)
+        style.configure("FullTransparent.TLabelframe",
+                        background=self.root["bg"],
+                        borderwidth=0,
+                        relief="flat")
+        style.configure("FullTransparent.TLabelframe.Label",
+                        background=self.root["bg"])
+
+        status_card = ttk.LabelFrame(
+            main_container,
+            text="实时状态监控",
+            padding="10 10 10 10",
+            style="FullTransparent.TLabelframe"
+        )
         status_card.pack(fill="x", pady=(0, 10))
 
         status_grid = ttk.Frame(status_card)
@@ -700,44 +732,62 @@ class FanCurveGUI:
             text="风扇曲线配置（0-90度，每10度一个控制点）",
             padding="10 10 10 10"
         )
-        config_card.pack(side="left", fill="both", expand=True, padx=(0, 10))
+        config_card.pack(side="top", fill="x", expand=False, padx=(0, 10))
+
+        # ---- 拆分config_card为“左（曲线图）+ 右（控件）” ----
+        # 左容器：放曲线图
+        curve_frame = ttk.Frame(config_card)
+        curve_frame.pack(side="left", fill="both", expand=False)  # 占满左侧空间
+
+        # 右容器：放低温阈值、同速模式等控件
+        ctrl_frame = ttk.Frame(config_card, padding=(15, 0))  # 右侧内边距
+        ctrl_frame.pack(side="left", fill="both", expand=True)  # 纵向占满，不扩展宽度
+
+        # 创建组件
+        self.curve_widget = FanCurveWidget(curve_frame, cpu_data=self.edit_cpu_curve, gpu_data=self.edit_gpu_curve)
+        self.curve_widget.pack(side="left", expand=False, padx=8, pady=8)
+        self.curve_widget.on_data_change = self.on_data_change
+
+        # 初始化显示
+        self.on_data_change(self.edit_cpu_curve, self.edit_gpu_curve)
 
         # 配置说明
-        ttk.Label(
-            config_card,
-            text="提示：修改数值后点击其他区域或按回车键自动生效（仅自定义模式可编辑）",
-            foreground="#666",
-            font=("微软雅黑", 10)
-        ).pack(anchor="w", pady=(0, 10))
+        # ttk.Label(
+        #     config_card,
+        #     text="提示：修改数值后点击其他区域或按回车键自动生效（仅自定义模式可编辑）",
+        #     foreground="#666",
+        #     font=("微软雅黑", 10)
+        # ).pack(anchor="w", pady=(0, 10))
 
         # CPU曲线配置
-        ttk.Label(config_card, text="CPU风扇曲线（温度℃: 转速%）", style="Header.TLabel").pack(anchor="w", pady=(10, 5))
-        self.cpu_curve_entries = self._create_curve_entries(config_card, self.edit_cpu_curve, is_cpu=True)
-
-        # GPU曲线配置
-        ttk.Label(config_card, text="GPU风扇曲线（温度℃: 转速%）", style="Header.TLabel").pack(anchor="w", pady=(10, 5))
-        self.gpu_curve_entries = self._create_curve_entries(config_card, self.edit_gpu_curve, is_cpu=False)
+        # ttk.Label(config_card, text="CPU风扇曲线（温度℃: 转速%）", style="Header.TLabel").pack(anchor="w", pady=(10, 5))
+        # self.cpu_curve_entries = self._create_curve_entries(config_card, self.edit_cpu_curve, is_cpu=True)
+        #
+        # # GPU曲线配置
+        # ttk.Label(config_card, text="GPU风扇曲线（温度℃: 转速%）", style="Header.TLabel").pack(anchor="w", pady=(10, 5))
+        # self.gpu_curve_entries = self._create_curve_entries(config_card, self.edit_gpu_curve, is_cpu=False)
 
         # 低温阈值和配置管理
-        ttk.Separator(config_card, orient="horizontal").pack(fill="x", pady=15)
+        ttk.Separator(ctrl_frame, orient="horizontal").pack(fill="x", pady=15)
 
         # 低温阈值设置
-        threshold_frame = ttk.Frame(config_card)
+        threshold_frame = ttk.Frame(ctrl_frame)
         threshold_frame.pack(fill="x", pady=(0, 10))
 
         ttk.Label(threshold_frame, text="低温自动切换阈值：", style="Header.TLabel").pack(side="left", padx=(0, 0))
         self.threshold_entry = ttk.Entry(threshold_frame, width=5, font=("微软雅黑", 13))
         self.threshold_entry.insert(0, str(self.controller.low_temp_threshold))
         self.threshold_entry.pack(side="left", padx=(0, 5))
-        ttk.Label(threshold_frame, text="℃（双温低于此值时自动切换为自动模式）").pack(side="left")
+        ttk.Label(threshold_frame, text="℃").pack(side="left")
         self.threshold_entry.bind("<FocusOut>", self._on_threshold_change)
         self.threshold_entry.bind("<Return>", lambda e: self._handle_enter_key(e, is_threshold=True))
+        ttk.Label(ctrl_frame, text="(双温低于阈值时，切换为自动模式)", style="Header.TLabel").pack(fill="x", padx=(0, 0))
 
         # 同速模式
-        same_speed_frame = ttk.Frame(config_card)
-        same_speed_frame.pack(fill="x", pady=(0, 0))
+        same_speed_frame = ttk.Frame(ctrl_frame)
+        same_speed_frame.pack(fill="x", pady=(20, 0))
 
-        ttk.Label(same_speed_frame, text="同速模式：", style="Header.TLabel").pack(side="left", padx=(0, 0))
+        ttk.Label(same_speed_frame, text="同速模式：", style="Header.TLabel").pack(side="left", padx=(0, 10))
         self.same_speed_choice_open = ttk.Radiobutton(
             same_speed_frame,
             text="开",
@@ -757,10 +807,12 @@ class FanCurveGUI:
             style="Custom.TRadiobutton"
         )
         self.same_speed_choice_close.pack(side="left", padx=5)
-
+        ttk.Label(ctrl_frame, text="(以CPU或GPU温度高的曲线配置调控转速)", style="Header.TLabel").pack(fill="x",
+                                                                                                       pady=(8, 0),
+                                                                                                       padx=(0, 0))
         # 配置文件管理按钮
-        config_buttons_frame = ttk.Frame(config_card)
-        config_buttons_frame.pack(fill="x", pady=(10, 0))
+        config_buttons_frame = ttk.Frame(ctrl_frame)
+        config_buttons_frame.pack(fill="x", pady=(20, 0))
 
         ttk.Label(config_buttons_frame, text="配置管理：", style="Header.TLabel").pack(side="left", padx=(0, 0))
         # self.load_config_btn = ttk.Button(config_buttons_frame, text="加载配置", command=self.load_config,style="Custom.TButton")
@@ -772,26 +824,47 @@ class FanCurveGUI:
                                               command=self.restore_default_config, style="Custom.TButton")
         self.restore_default_btn.pack(side="left", padx=0)
 
-        more_setting_buttons_frame = ttk.Frame(config_card)
-        more_setting_buttons_frame.pack(fill="x", pady=(10, 0))
+        ttk.Separator(ctrl_frame, orient="horizontal").pack(fill="x", pady=15)
+
+        more_setting_buttons_frame = ttk.Frame(ctrl_frame)
+        more_setting_buttons_frame.pack(fill="x", pady=(0, 0))
 
         ttk.Label(more_setting_buttons_frame, text="控制中心：", style="Header.TLabel").pack(side="left", padx=(0, 0))
-        ttk.Button(more_setting_buttons_frame, text="更多设置", command=self.view_more_setting, style="Custom.TButton").pack(
-            side="left", padx=0)
+        ttk.Button(more_setting_buttons_frame, text="更多设置", command=self.view_more_setting,
+                   style="Custom.TButton").pack(side="left", padx=0)
 
+        bg_buttons_frame = ttk.Frame(ctrl_frame)
+        bg_buttons_frame.pack(fill="x", pady=(100, 0))
 
+        # ttk.Label(bg_buttons_frame, text="界面美化：", style="Header.TLabel").pack(side="left", padx=(0, 0))
+        # ttk.Button(bg_buttons_frame, text="添加背景", command=self.view_more_setting,
+        #            style="Custom.TButton").pack(side="left", padx=0)
+        # bg_bright_scale_frame = ttk.Frame(ctrl_frame)
+        # bg_bright_scale_frame.pack(fill="x", pady=(10, 0))
+        # ttk.Label(bg_bright_scale_frame, text="背景透明：", style="Header.TLabel").pack(side="left", padx=(0, 0))
+        # bright_scale = tk.Scale(
+        #     bg_bright_scale_frame,
+        #     from_=0.0,
+        #     to=1.0,
+        #     resolution=0.05,  # 调节步长0.05
+        #     variable=self.brightness_var,
+        #     orient="horizontal",
+        #     length=200  # 核心：缩短滑块长度
+        # )
+        # bright_scale.pack(side="left", padx=5)
+
+        ttk.Separator(ctrl_frame, orient="horizontal").pack(fill="x", pady=15)
 
         # 右侧：曲线预览卡片
-        plot_card = ttk.LabelFrame(content_frame, text="曲线预览", padding="10 10 10 10")
-        plot_card.pack(side="right", fill="both", expand=True, padx=(10, 0))
-
-        self.plot_container = ttk.Frame(plot_card)
-        self.plot_container.pack(fill="both", expand=True)
+        # plot_card = ttk.LabelFrame(content_frame, text="曲线预览", padding="10 10 10 10")
+        # plot_card.pack(side="right", fill="both", expand=True, padx=(10, 0))
+        #
+        # self.plot_container = ttk.Frame(plot_card)
+        # self.plot_container.pack(fill="both", expand=True)
 
         # 底部操作区
         footer_frame = ttk.Frame(main_container)
         footer_frame.pack(fill="x", pady=10)
-
 
         ttk.Button(footer_frame, text="查看日志", command=self.view_current_log, style="Custom.TButton").pack(
             side="right", padx=5)
@@ -840,9 +913,11 @@ class FanCurveGUI:
             return
 
         # 判断是否为曲线输入框或阈值输入框
-        is_curve_entry = (focused_widget in self.cpu_curve_entries.values() or
-                          focused_widget in self.gpu_curve_entries.values() or
-                          focused_widget == self.threshold_entry)
+        # is_curve_entry = (focused_widget in self.cpu_curve_entries.values() or
+        #                   focused_widget in self.gpu_curve_entries.values() or
+        #                   focused_widget == self.threshold_entry)
+
+        is_curve_entry = (focused_widget == self.threshold_entry)
 
         # 点击外部时失焦
         if is_curve_entry and event.widget != focused_widget:
@@ -864,7 +939,7 @@ class FanCurveGUI:
             return
 
         try:
-            entries = self.cpu_curve_entries if is_cpu else self.gpu_curve_entries
+            # entries = self.cpu_curve_entries if is_cpu else self.gpu_curve_entries
             curve = self.edit_cpu_curve if is_cpu else self.edit_gpu_curve
 
             # 验证输入
@@ -883,7 +958,7 @@ class FanCurveGUI:
                 self.controller.applied_gpu_curve = self.edit_gpu_curve.copy()
 
             # 刷新图表和保存配置
-            self._update_plot()
+            # self._update_plot()
             curve_type = "CPU" if is_cpu else "GPU"
             self.logger.info(f"{curve_type}风扇曲线更新：{temp}℃ → {val}%")
             success, msg = self.controller.save_config()
@@ -902,6 +977,21 @@ class FanCurveGUI:
             error_msg = f"更新曲线失败：{str(e)}"
             self.logger.error(error_msg)
             messagebox.showerror("操作失败", error_msg)
+
+    def on_data_change(self, cpu, gpu):
+
+        if not self.controller.is_custom_mode or self.controller.is_full_mode:
+            return
+
+        if cpu != self.controller.applied_cpu_curve:
+            self.controller.applied_cpu_curve = cpu.copy()
+            self.controller.cpu_fans = list(cpu.values()).copy()
+
+        if gpu != self.controller.applied_gpu_curve:
+            self.controller.applied_gpu_curve = gpu
+            self.controller.gpu_fans = list(gpu.values()).copy()
+
+        self.controller.save_config()
 
     def save_config(self, as_new=False):
         """保存配置文件"""
@@ -930,6 +1020,21 @@ class FanCurveGUI:
             self.logger.error(error_msg)
             messagebox.showerror("错误", error_msg)
 
+    def load_setting_config(self):
+        """加载启动配置"""
+        if os.path.exists(self.setting_config_path):
+            self.setting_config.read(self.setting_config_path, encoding='utf-8')
+            self.bg_transparency = self.setting_config.getfloat('Settings', 'bg_transparency', fallback=0.8)
+            bg_image_path = "./asset/background.png"
+            self.bg_image_path = self.setting_config.get('Settings', 'bg_image_path', fallback=bg_image_path)
+
+    def save_setting_config(self):
+        """保存启动配置"""
+        self.setting_config.set("Settings", "bg_transparency", str(self.bg_transparency))
+        self.setting_config.set("Settings", "bg_image_path", str(self.bg_image_path))
+        with open(self.setting_config_path, 'w', encoding='utf-8') as f:
+            self.setting_config.write(f)
+
     def load_config(self):
         """加载配置文件"""
         try:
@@ -948,12 +1053,12 @@ class FanCurveGUI:
                 # 更新编辑缓存和输入框
                 self.edit_cpu_curve = self.controller.applied_cpu_curve.copy()
                 self.edit_gpu_curve = self.controller.applied_gpu_curve.copy()
-                for temp, entry in self.cpu_curve_entries.items():
-                    entry.delete(0, tk.END)
-                    entry.insert(0, str(self.edit_cpu_curve[temp]))
-                for temp, entry in self.gpu_curve_entries.items():
-                    entry.delete(0, tk.END)
-                    entry.insert(0, str(self.edit_gpu_curve[temp]))
+                # for temp, entry in self.cpu_curve_entries.items():
+                #     entry.delete(0, tk.END)
+                #     entry.insert(0, str(self.edit_cpu_curve[temp]))
+                # for temp, entry in self.gpu_curve_entries.items():
+                #     entry.delete(0, tk.END)
+                #     entry.insert(0, str(self.edit_gpu_curve[temp]))
 
                 # 更新阈值和模式选择
                 self.threshold_entry.delete(0, tk.END)
@@ -962,7 +1067,7 @@ class FanCurveGUI:
                 self.full_mode_choice.set("开" if self.controller.is_full_mode else "关")
 
                 # 刷新图表和权限
-                self._update_plot()
+                # self._update_plot()
                 self._set_curve_editable(self.controller.is_custom_mode and not self.controller.is_full_mode)
                 self._set_config_buttons_state(self.controller.is_custom_mode and not self.controller.is_full_mode)
 
@@ -988,14 +1093,20 @@ class FanCurveGUI:
                 self.controller.same_speed = False
 
                 # 更新编辑缓存和输入框
-                self.edit_cpu_curve = self.controller.applied_cpu_curve.copy()
-                self.edit_gpu_curve = self.controller.applied_gpu_curve.copy()
-                for temp, entry in self.cpu_curve_entries.items():
-                    entry.delete(0, tk.END)
-                    entry.insert(0, str(self.edit_cpu_curve[temp]))
-                for temp, entry in self.gpu_curve_entries.items():
-                    entry.delete(0, tk.END)
-                    entry.insert(0, str(self.edit_gpu_curve[temp]))
+                # self.edit_cpu_curve = self.controller.applied_cpu_curve.copy()
+                # self.edit_gpu_curve = self.controller.applied_gpu_curve.copy()
+                # for temp, entry in self.cpu_curve_entries.items():
+                #     entry.delete(0, tk.END)
+                #     entry.insert(0, str(self.edit_cpu_curve[temp]))
+                # for temp, entry in self.gpu_curve_entries.items():
+                #     entry.delete(0, tk.END)
+                #     entry.insert(0, str(self.edit_gpu_curve[temp]))
+
+                default = [0, 38, 38, 38, 38, 47, 55, 64, 74, 83]
+                applied_cpu_curve = {i: j for i, j in zip(range(0, 100, 10), default)}
+                applied_gpu_curve = {i: j for i, j in zip(range(0, 100, 10), default)}
+                self.on_data_change(applied_cpu_curve, applied_gpu_curve)
+                self.curve_widget.set_data(default, default)
 
                 # 更新阈值和模式选择
                 self.threshold_entry.delete(0, tk.END)
@@ -1003,8 +1114,9 @@ class FanCurveGUI:
                 self.fan_mode_var.set("自定义模式")
                 self.full_mode_choice.set("关")
 
+                self.curve_widget.set_editable(True)
                 # 刷新图表和权限
-                self._update_plot()
+                # self._update_plot()
                 self._set_curve_editable(True)
                 self._set_config_buttons_state(True)
 
@@ -1045,10 +1157,10 @@ class FanCurveGUI:
     def _set_curve_editable(self, editable):
         """设置曲线编辑区域是否可编辑"""
         state = "normal" if editable else "disabled"
-        for entry in self.cpu_curve_entries.values():
-            entry.config(state=state)
-        for entry in self.gpu_curve_entries.values():
-            entry.config(state=state)
+        # for entry in self.cpu_curve_entries.values():
+        #     entry.config(state=state)
+        # for entry in self.gpu_curve_entries.values():
+        #     entry.config(state=state)
         self.threshold_entry.config(state=state)
 
     def _set_config_buttons_state(self, enabled):
@@ -1060,32 +1172,32 @@ class FanCurveGUI:
         self.same_speed_choice_close.config(state=state)
         self.restore_default_btn.config(state=state)
 
-    def _init_plot(self):
-        """初始化曲线预览图"""
-        self.fig, self.ax = plt.subplots(figsize=(5, 4), facecolor='none')
-        self.ax.set_facecolor('#f8f9fa')
-        self.ax.set_xlabel('温度（℃）', fontsize=10)
-        self.ax.set_ylabel('风扇转速（%）', fontsize=10)
-        self.ax.set_title('风扇曲线预览', fontsize=12, fontweight='bold')
-
-        # 坐标轴设置
-        self.ax.set_xticks(range(0, 105, 10))
-        self.ax.set_yticks(range(0, 105, 10))
-        self.ax.set_xlim(0, 100)
-        self.ax.set_ylim(0, 100)
-        self.ax.grid(True, alpha=0.3)
-
-        # 画布初始化
-        self.canvas = FigureCanvasTkAgg(self.fig, master=self.plot_container)
-        self.canvas.draw()
-        self.canvas.get_tk_widget().pack(fill="both", expand=True)
-
-        # 曲线和点标记
-        self.cpu_line, = self.ax.plot([], [], 'r-', linewidth=2.5, label='CPU风扇', alpha=0.85)
-        self.cpu_points, = self.ax.plot([], [], 'ro', markersize=7, alpha=0.85, markeredgecolor='darkred')
-        self.gpu_line, = self.ax.plot([], [], 'b-', linewidth=2.5, label='GPU风扇', alpha=0.85)
-        self.gpu_points, = self.ax.plot([], [], 'bs', markersize=7, alpha=0.85, markeredgecolor='darkblue')
-        self.ax.legend(loc='lower right', fontsize=9)
+    # def _init_plot(self):
+    #     """初始化曲线预览图"""
+    #     self.fig, self.ax = plt.subplots(figsize=(5, 4), facecolor='none')
+    #     self.ax.set_facecolor('#f8f9fa')
+    #     self.ax.set_xlabel('温度（℃）', fontsize=10)
+    #     self.ax.set_ylabel('风扇转速（%）', fontsize=10)
+    #     self.ax.set_title('风扇曲线预览', fontsize=12, fontweight='bold')
+    #
+    #     # 坐标轴设置
+    #     self.ax.set_xticks(range(0, 105, 10))
+    #     self.ax.set_yticks(range(0, 105, 10))
+    #     self.ax.set_xlim(0, 100)
+    #     self.ax.set_ylim(0, 100)
+    #     self.ax.grid(True, alpha=0.3)
+    #
+    #     # 画布初始化
+    #     self.canvas = FigureCanvasTkAgg(self.fig, master=self.plot_container)
+    #     self.canvas.draw()
+    #     self.canvas.get_tk_widget().pack(fill="both", expand=True)
+    #
+    #     # 曲线和点标记
+    #     self.cpu_line, = self.ax.plot([], [], 'r-', linewidth=2.5, label='CPU风扇', alpha=0.85)
+    #     self.cpu_points, = self.ax.plot([], [], 'ro', markersize=7, alpha=0.85, markeredgecolor='darkred')
+    #     self.gpu_line, = self.ax.plot([], [], 'b-', linewidth=2.5, label='GPU风扇', alpha=0.85)
+    #     self.gpu_points, = self.ax.plot([], [], 'bs', markersize=7, alpha=0.85, markeredgecolor='darkblue')
+    #     self.ax.legend(loc='lower right', fontsize=9)
 
     def _update_plot(self):
         """更新曲线预览图"""
@@ -1174,6 +1286,7 @@ class FanCurveGUI:
             self.controller.switch_fan_mode(mode_code)
             # 更新权限
             is_editable = mode_code == "manual" and not self.controller.is_full_mode
+            self.curve_widget.set_editable(is_editable)
             self._set_curve_editable(is_editable)
             self._set_config_buttons_state(is_editable)
             self.update_status_text()
@@ -1221,6 +1334,7 @@ class FanCurveGUI:
 
             # 更新权限
             is_editable = self.controller.is_custom_mode and not target_enable
+            self.curve_widget.set_editable(is_editable)
             self._set_curve_editable(is_editable)
             self._set_config_buttons_state(is_editable)
 
@@ -1330,6 +1444,7 @@ class FanCurveGUI:
 
                 # 更新权限
                 is_editable = self.controller.is_custom_mode and not new_full_mode
+                self.root.after(0, lambda: self.curve_widget.set_editable(is_editable))
                 self.root.after(0, lambda: self._set_curve_editable(is_editable))
                 self.root.after(0, lambda: self._set_config_buttons_state(is_editable))
 
@@ -1361,9 +1476,9 @@ class FanCurveGUI:
             # 创建子窗口
             self.more_window = tk.Toplevel(self.root)
             self.more_window.title("更多设置")
-            screen_width =  self.more_window.winfo_screenwidth()
+            screen_width = self.more_window.winfo_screenwidth()
             screen_height = self.more_window.winfo_screenheight()
-            width, height=(1080,720)
+            width, height = (1080, 720)
             # 计算窗口左上角的x、y坐标
             x = int((screen_width - width) / 2)
             y = int((screen_height - height) / 2)
@@ -1767,8 +1882,10 @@ class FanCurveGUI:
             self.brightness_var.set(self.controller.wmi.GetScreenBrightness())
         self.controller.win_lock = self.win_key_var.get()
         self.controller.auto_close_light = self.kl_auto_off_var.get()
-        self.controller.keyboard = [self.keyboard_light_var.get(), self.kl_color_widget.get_selected(), self.kl_bright_var.get()]
-        self.controller.led = [self.ambient_light_var.get(), self.al_color_widget.get_selected(), self.al_bright_var.get()]
+        self.controller.keyboard = [self.keyboard_light_var.get(), self.kl_color_widget.get_selected(),
+                                    self.kl_bright_var.get()]
+        self.controller.led = [self.ambient_light_var.get(), self.al_color_widget.get_selected(),
+                               self.al_bright_var.get()]
         self.controller.charging_mode = self.charge_var.get()
 
     def view_current_log(self):
@@ -1791,9 +1908,9 @@ class FanCurveGUI:
             # 创建日志窗口
             self.log_window = tk.Toplevel(self.root)
             self.log_window.title(f"日志查看 - {os.path.basename(log_file)}")
-            screen_width =  self.log_window.winfo_screenwidth()
+            screen_width = self.log_window.winfo_screenwidth()
             screen_height = self.log_window.winfo_screenheight()
-            width, height=(1080,720)
+            width, height = (1080, 720)
             # 计算窗口左上角的x、y坐标
             x = int((screen_width - width) / 2)
             y = int((screen_height - height) / 2)
@@ -1916,8 +2033,9 @@ class FanCurveGUI:
             self.monitor_thread.join(timeout=1.0)
         self.controller.restore_default_mode()  # 恢复默认风扇模式
         self.controller.save_config()  # 保存最终配置
+        self.save_setting_config()
         self.logger.info("程序已关闭")
-        plt.close(self.fig)  # 关闭图表
+        # plt.close(self.fig)  # 关闭图表
         self.root.destroy()
 
 
@@ -1980,18 +2098,20 @@ class TrayApp:
     # 配置管理
     def load_config(self):
         """加载启动配置"""
-        config = configparser.ConfigParser()
-        if os.path.exists(self.config):
-            config.read(self.config, encoding='utf-8')
+        config_path = self.main_gui.setting_config_path
+        config = self.main_gui.setting_config
+        if os.path.exists(config_path):
+            config.read(config_path, encoding='utf-8')
             self.start_minimized = config.getboolean(
                 'Settings', 'start_minimized', fallback=False
             )
 
     def save_config(self):
         """保存启动配置"""
-        config = configparser.ConfigParser()
-        config['Settings'] = {'start_minimized': str(self.start_minimized)}
-        with open(self.config, 'w', encoding='utf-8') as f:
+        config_path = self.main_gui.setting_config_path
+        config = self.main_gui.setting_config
+        config.set('Settings', 'start_minimized', str(self.start_minimized))
+        with open(config_path, 'w', encoding='utf-8') as f:
             config.write(f)
 
     # 开机启动管理（核心修改：改用任务计划）
